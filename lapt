@@ -121,6 +121,8 @@ dpkg_opts=(--admindir="$admin" --instdir="$root" --force-not-root
 # and configure it without them. Its prerm and postrm expect root too, and a
 # partial run of those is worse than none: Chrome's would delete its icons
 # from ~/.local, then fail and block the removal.
+#
+# Uses main's apt_opts.
 skip_failed_scripts() {
     local pkgs pkg script
     pkgs=$(dpkg-query --admindir="$admin" -W -f '${db:Status-Abbrev} ${binary:Package}\n' |
@@ -136,6 +138,14 @@ skip_failed_scripts() {
             printf '#!/bin/sh\nexit 0\n' > "$admin/info/$pkg.$script"
             chmod +x "$admin/info/$pkg.$script"
         done
+
+        # Vendor packages usually add their own repository, which is how they
+        # get updates.
+        if grep -q /etc/apt/sources.list "$admin/info/$pkg.postinst.lapt-failed" 2>/dev/null &&
+           ! apt-cache "${apt_opts[@]}" policy "$pkg" | grep -Eq '^ +[0-9]+ [a-z]+:/'; then
+            echo "lapt: $pkg's postinst tries to add an apt repository, and lapt has none" \
+                 "for it, so it won't get updates; add one to $here/sources.list.d/" >&2
+        fi
     done
 
     dpkg "${dpkg_opts[@]}" --configure -a
