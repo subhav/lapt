@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# Run by lapt after each dpkg run, to fix paths in installed packages that
+# assume they were installed to /. Everything here is safe to rerun.
+#
+# Usage: LAPT_ROOT=ROOT fixup
+
+set -euo pipefail
+
+root=${LAPT_ROOT:?}
+admin=$root/var/lib/dpkg
+
+# Point symlinks at the right place:
+# - Absolute links to a file we have go to our copy.
+# - Broken links go to our copy, or else to the system's. This catches .so
+#   links in -dev packages, whose library is installed on the system.
+fix_symlink() {
+    local path=$1 link=$root$1 target logical
+
+    target=$(readlink "$link")
+    if [[ $target == /* ]]; then
+        logical=$target
+    else
+        logical=$(realpath -ms "$(dirname "$path")/$target")
+    fi
+
+    if [[ $target == /* && -e $root$logical ]] || [ ! -e "$link" ]; then
+        if [ -e "$root$logical" ]; then
+            ln -sfn "$root$logical" "$link"
+        elif [ -e "$logical" ]; then
+            ln -sfn "$logical" "$link"
+        fi
+    fi
+}
+
+# Point Exec=, TryExec= and Icon= paths in .desktop files at our copies.
+fix_desktop() {
+    local file=$root$1
+    awk -v root="$root" '
+        /^(Exec|TryExec|Icon)=\// {
+            eq = index($0, "=")
+            cmd = substr($0, eq + 1)
+            prog = cmd; sub(/[ \t].*/, "", prog)
+            if (system("test -e \"" root prog "\"") == 0)
+                $0 = substr($0, 1, eq) root cmd
+        }
+        { print }
+    ' "$file" > "$file.lapt-tmp"
+    if cmp -s "$file" "$file.lapt-tmp"; then
+        rm "$file.lapt-tmp"
+    else
+        mv "$file.lapt-tmp" "$file"
+    fi
+}
+
+cat "$admin"/info/*.list | sort -u | while IFS= read -r path; do
+    if [ -L "$root$path" ]; then
+        fix_symlink "$path"
+    elif [[ $path == *.desktop && -f $root$path ]]; then
+        fix_desktop "$path"
+    fi
+done
+
+# Rebuild the caches that dpkg triggers would on a normal install. The system
+# packages that own those triggers aren't in our dpkg database, so they never
+# fire for packages installed here. A failure here shouldn't fail the install.
+#
+# The icon cache is left out on purpose: GTK finds icons fine without one, and
+# a cache that falls out of date hides icons added after it.
+rebuild() {
+    "$@" || echo "fixup: '$*' failed" >&2
+}
+[ -d "$root/share/glib-2.0/schemas" ] && rebuild glib-compile-schemas "$root/share/glib-2.0/schemas"
+[ -d "$root/share/mime/packages" ] && rebuild update-mime-database "$root/share/mime"
+[ -d "$root/share/applications" ] && rebuild update-desktop-database "$root/share/applications"
+true

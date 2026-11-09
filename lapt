@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+#
+# Run apt against a user-owned dpkg root layered over the system.
+#
+# Packages are unpacked into $LAPT_ROOT with their own dpkg database, so they
+# can be listed and removed. Dependencies already installed on the system are
+# used as-is rather than duplicated. The default root is /local/scratch/a/$USER,
+# the local disk on ECN hosts that have one.
+#
+# $LAPT_ROOT/usr is a symlink to ".", so /usr/bin lands in $LAPT_ROOT/bin and
+# so on, matching the layout the shell profile already puts on PATH.
+#
+# Extra apt repositories go in sources.list.d/ next to this script, as .sources
+# files with their key inline. `lapt update` refreshes only those; the system's
+# package lists are used as-is, since the admins keep them current.
+#
+# Usage: lapt APT-COMMAND ARGS...        e.g. lapt install tio
+#        lapt dpkg DPKG-ARGS...          e.g. lapt dpkg -l, lapt dpkg -S FILE
+#        lapt --local APT-QUERY ARGS...  e.g. lapt --local list --installed
+#
+# --local hides the system's packages from apt list, show, policy, search,
+# depends and rdepends.
+
+here=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+root=${LAPT_ROOT:-/local/scratch/a/$USER}
+admin=$root/var/lib/dpkg
+lists=$root/var/lib/apt/lists
+sourceparts=$root/etc/apt/sources.list.d
+# The status file with only our packages, for --local.
+local_status=$root/var/lib/lapt-local.status
+
+die() { echo "lapt: $*" >&2; exit 1; }
+
+init() {
+    [ -d "$root" ] || die "$root doesn't exist on this host; set LAPT_ROOT to use another root"
+
+    mkdir -p "$admin"/{info,updates,triggers} "$lists"/partial "$sourceparts" \
+             "$root"/var/cache/apt/archives/partial "$root"/var/log/apt
+    touch "$admin"/status "$admin"/available
+
+    # dpkg unpacks through this the same way it does on a usrmerge system.
+    [ -e "$root/usr" ] || ln -s . "$root/usr"
+    [ -L "$root/usr" ] || die "$root/usr exists and isn't a symlink to ."
+}
+
+# Rebuild the status file from the system's, keeping our own packages.
+#
+# Ours are the ones with a non-empty file list here. System packages get an
+# empty one, which stops dpkg warning about every one of them on each run, and
+# an empty md5sums, which keeps them out of `lapt dpkg --audit`.
+sync_status() {
+    local owned tmp
+    owned=$(find "$admin/info" -maxdepth 1 -name '*.list' -size +0 -printf '%f\n')
+    tmp=$(mktemp "$admin/status.XXXXXX")
+
+    awk -v owned="$owned" -v lists="$tmp.lists" -v ours="$tmp.ours" '
+        BEGIN {
+            RS = ""; ORS = "\n\n"
+            n = split(owned, o, "\n")
+            for (i = 1; i <= n; i++) { sub(/\.list$/, "", o[i]); is_owned[o[i]] }
+        }
+        function field(name,   s) {
+            if (!match($0, "(^|\n)" name ": [^\n]*")) return ""
+            s = substr($0, RSTART, RLENGTH)
+            sub(/^\n?[^:]*: /, "", s)
+            return s
+        }
+        # dpkg names the file list pkg:arch.list only for Multi-Arch: same.
+        function list_name(   p) {
+            p = field("Package")
+            return field("Multi-Arch") == "same" ? p ":" field("Architecture") : p
+        }
+        FILENAME == ARGV[1] {
+            if (list_name() in is_owned) { print; print > ours; seen[list_name()] }
+            next
+        }
+        !(list_name() in seen) { print; print list_name() > lists }
+    ' "$admin/status" /var/lib/dpkg/status > "$tmp"
+
+    while IFS= read -r name; do
+        [ -e "$admin/info/$name.list" ] || : > "$admin/info/$name.list"
+        [ -e "$admin/info/$name.md5sums" ] || : > "$admin/info/$name.md5sums"
+    done < "$tmp.lists"
+    rm "$tmp.lists"
+    touch "$tmp.ours"
+    mv "$tmp.ours" "$local_status"
+    mv "$tmp" "$admin/status"
+}
+
+# apt only takes one sources.list.d, so make one out of links to the system's
+# sources and ours. Likewise, link the system's package lists in with the ones
+# `lapt update` downloads for our sources.
+link_sources() {
+    local f
+    find "$sourceparts" -maxdepth 1 -type l -delete
+    for f in /etc/apt/sources.list.d/* "$here"/sources.list.d/*; do
+        case $f in *.list | *.sources) ln -s "$f" "$sourceparts/" ;; esac
+    done
+
+    find "$lists" -maxdepth 1 -xtype l -delete
+    for f in /var/lib/apt/lists/*; do
+        [ -f "$f" ] && [ "${f##*/}" != lock ] || continue
+        [ -e "$lists/${f##*/}" ] || ln -s "$f" "$lists/"
+    done
+}
+
+dpkg_opts=(--admindir="$admin" --instdir="$root" --force-not-root
+           --force-script-chrootless --log="$root/var/log/dpkg.log")
+
+# Maintainer scripts run as us on the real system, so vendor packages' (e.g.
+# Chrome, Warp) tend to fail setting up apt sources, icons in /usr and so on.
+# Set aside the scripts of any package that was left half-configured by that,
+# and configure it without them. Its prerm and postrm expect root too, and a
+# partial run of those is worse than none: Chrome's would delete its icons
+# from ~/.local, then fail and block the removal.
+skip_failed_scripts() {
+    local pkgs pkg script
+    pkgs=$(dpkg-query --admindir="$admin" -W -f '${db:Status-Abbrev} ${binary:Package}\n' |
+           awk '$1 == "iF" { print $2 }')
+    [ -n "$pkgs" ] || return 1
+
+    for pkg in $pkgs; do
+        echo "lapt: $pkg's maintainer scripts failed; configuring it without them" \
+             "(originals saved as $admin/info/$pkg.*.lapt-failed)" >&2
+        for script in postinst prerm postrm; do
+            [ -e "$admin/info/$pkg.$script" ] || continue
+            mv "$admin/info/$pkg.$script" "$admin/info/$pkg.$script.lapt-failed"
+            printf '#!/bin/sh\nexit 0\n' > "$admin/info/$pkg.$script"
+            chmod +x "$admin/info/$pkg.$script"
+        done
+    done
+
+    dpkg "${dpkg_opts[@]}" --configure -a
+    "$here/fixup"
+
+    # apt only deletes the downloaded .debs after a run that succeeds.
+    rm -f "$root"/var/cache/apt/archives/*.deb
+}
+
+main() {
+    local only_ours=
+    if [ "${1-}" = --local ]; then
+        only_ours=1
+        shift
+    fi
+    [ "$#" -ge 1 ] || die "usage: lapt [--local] APT-COMMAND ARGS... | lapt dpkg ARGS..."
+
+    init
+
+    if [ -n "$only_ours" ]; then
+        case $1 in
+            list | show | policy | search | depends | rdepends) ;;
+            # Anything that installs or removes would see system packages
+            # as missing.
+            *) die "--local only works with apt list, show, policy, search, depends and rdepends" ;;
+        esac
+    fi
+
+    case $1 in
+        dpkg)
+            shift
+            exec dpkg "${dpkg_opts[@]}" "$@"
+            ;;
+        upgrade | dist-upgrade | full-upgrade)
+            # Would pull every pending system update into the root.
+            die "'$1' isn't supported; use 'lapt install PKG' to upgrade specific packages"
+            ;;
+    esac
+
+    sync_status
+    link_sources
+
+    local status_file=$admin/status
+    [ -z "$only_ours" ] || status_file=$local_status
+
+    local apt_opts=(
+        -c "$here/apt.conf"
+        -o "APT::Sandbox::User=$(id -un)"
+        -o "Dir::State::status=$status_file"
+        -o "Dir::State::extended_states=$root/var/lib/apt/extended_states"
+        -o "Dir::State::Lists=$lists"
+        -o "Dir::Etc::sourceparts=$sourceparts"
+        -o "Dir::Cache=$root/var/cache/apt"
+        -o "Dir::Log=$root/var/log/apt"
+        -o "DPkg::Options::=--instdir=$root"
+        -o "DPkg::Options::=--admindir=$admin"
+        -o "DPkg::Options::=--log=$root/var/log/dpkg.log"
+        -o "DPkg::Post-Invoke::=$here/fixup"
+    )
+
+    if [ "$1" = update ]; then
+        # Only fetch lists for our sources, and keep the links to the system's,
+        # which apt would otherwise clean up as unknown files.
+        apt_opts+=(
+            -o "Dir::Etc::sourcelist=/dev/null/none"
+            -o "Dir::Etc::sourceparts=$here/sources.list.d"
+            -o "APT::Get::List-Cleanup=false"
+        )
+    fi
+
+    export LAPT_ROOT=$root
+    local status=0
+    apt "${apt_opts[@]}" "$@" || status=$?
+
+    if [ "$status" -ne 0 ] && skip_failed_scripts; then
+        status=0
+    fi
+    return "$status"
+}
+
+# Everything above is only definitions, so bash has read the whole file before
+# running any of it, and editing it mid-run is safe. It can also be sourced to
+# call the functions by hand.
+if [[ $0 == "${BASH_SOURCE[0]}" ]]; then
+    set -euo pipefail
+    main "$@"
+    exit
+fi
