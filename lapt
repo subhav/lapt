@@ -48,6 +48,10 @@ init() {
 # Ours are the ones with a non-empty file list here. System packages get an
 # empty one, which stops dpkg warning about every one of them on each run, and
 # an empty md5sums, which keeps them out of `lapt dpkg --audit`.
+#
+# System packages are also marked Protected, so apt won't plan to remove one
+# (e.g. pkg-config, for a package that Breaks it). We can't remove their files
+# anyway, and the next sync would mark them installed again.
 sync_status() {
     local owned tmp
     owned=$(find "$admin/info" -maxdepth 1 -name '*.list' -size +0 -printf '%f\n')
@@ -74,7 +78,11 @@ sync_status() {
             if (list_name() in is_owned) { print; print > ours; seen[list_name()] }
             next
         }
-        !(list_name() in seen) { print; print list_name() > lists }
+        !(list_name() in seen) {
+            if (field("Status") ~ / installed$/ && field("Protected") == "")
+                sub(/\nStatus: [^\n]*/, "&\nProtected: yes")
+            print; print list_name() > lists
+        }
     ' "$admin/status" /var/lib/dpkg/status > "$tmp"
 
     while IFS= read -r name; do
